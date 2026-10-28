@@ -1,0 +1,151 @@
+library(Seurat)
+library(SeuratObject)
+library(spacexr)
+library(Matrix)
+library(ggplot2)
+
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+
+xenium <- readRDS("Xenium_seurat.rds")
+visium <- readRDS("Visium_seurat.rds")
+
+celltype_col <- "cell_type"
+
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+
+xenium_counts <- GetAssayData(
+  xenium,
+  assay = "Xenium",
+  layer = "counts"
+)
+
+cell_types <- xenium@meta.data[
+  colnames(xenium_counts),
+  celltype_col
+]
+
+cell_types <- factor(cell_types)
+names(cell_types) <- colnames(xenium_counts)
+
+xenium_nUMI <- Matrix::colSums(xenium_counts)
+
+valid_cells <- !is.na(cell_types) & as.character(cell_types) != ""
+
+xenium_counts <- xenium_counts[, valid_cells, drop = FALSE]
+cell_types <- droplevels(cell_types[valid_cells])
+xenium_nUMI <- xenium_nUMI[valid_cells]
+
+reference <- Reference(
+  counts = xenium_counts,
+  cell_types = cell_types,
+  nUMI = xenium_nUMI
+)
+
+
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+
+visium_counts <- GetAssayData(
+  visium,
+  assay = "Spatial",
+  layer = "counts"
+)
+
+coords <- GetTissueCoordinates(visium)
+
+coords <- coords[colnames(visium_counts), , drop = FALSE]
+
+if (all(c("imagerow", "imagecol") %in% colnames(coords))) {
+
+  coords <- coords[, c("imagecol", "imagerow")]
+  colnames(coords) <- c("x", "y")
+
+} else if (all(c("x", "y") %in% colnames(coords))) {
+
+  coords <- coords[, c("x", "y")]
+
+} else if (all(c("row", "col") %in% colnames(coords))) {
+
+  coords <- coords[, c("col", "row")]
+  colnames(coords) <- c("x", "y")
+
+} else {
+
+  stop("Please check the Visium coordinate column names.")
+}
+
+stopifnot(identical(rownames(coords), colnames(visium_counts)))
+stopifnot(!anyNA(coords))
+
+visium_nUMI <- Matrix::colSums(visium_counts)
+
+puck <- SpatialRNA(
+  coords = coords,
+  counts = visium_counts,
+  nUMI = visium_nUMI
+)
+
+
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+
+myRCTD <- create.RCTD(
+  spatialRNA = puck,
+  reference = reference,
+  max_cores = 8
+)
+
+myRCTD <- run.RCTD(
+  myRCTD,
+  doublet_mode = "doublet"
+)
+
+
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+
+rctd_results <- myRCTD@results$results_df
+
+
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+
+rctd_results$RCTD_celltype <- as.character(
+  rctd_results$first_type
+)
+
+rctd_results$RCTD_celltype[
+  as.character(rctd_results$spot_class) == "reject"
+] <- NA_character_
+
+
+# ------------------------------------------------------------
+# ------------------------------------------------------------
+
+visium$RCTD_celltype <- NA_character_
+visium$RCTD_spot_class <- NA_character_
+
+common_spots <- intersect(
+  colnames(visium),
+  rownames(rctd_results)
+)
+
+visium@meta.data[
+  common_spots,
+  "RCTD_celltype"
+] <- rctd_results[
+  common_spots,
+  "RCTD_celltype"
+]
+
+visium@meta.data[
+  common_spots,
+  "RCTD_spot_class"
+] <- as.character(
+  rctd_results[
+    common_spots,
+    "spot_class"
+  ]
+)

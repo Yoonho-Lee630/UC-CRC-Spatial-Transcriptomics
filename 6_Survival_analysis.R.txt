@@ -1,0 +1,204 @@
+library(Seurat)
+library(dplyr)
+library(tibble)
+library(singscore)
+library(GSEABase)
+library(survival)
+library(survminer)
+library(ggplot2)
+
+setwd("D:/Project/UC_CRC/TCGA")
+
+expr_df_2 <- read.table("TCGA-COAD.star_tpm.tsv", header = T)
+pheno_df <- read.table("COAD_os_2.txt", header = TRUE, sep = "\t")
+
+library(biomaRt)
+
+mart <- useMart(
+  biomart = "ensembl",
+  dataset = "hsapiens_gene_ensembl"
+)
+
+ensembl_ids <- gsub("\\..*$", "", expr_df_2$Ensembl_ID)
+
+mapping <- getBM(
+  attributes = c("ensembl_gene_id", "hgnc_symbol"),
+  filters = "ensembl_gene_id",
+  values = ensembl_ids,
+  mart = mart
+)
+
+
+expr_df_2$ensembl_gene_id <- gsub("\\..*$", "", expr_df_2$Ensembl_ID)
+
+expr_mapped <- merge(
+  x = expr_df_2,
+  y = mapping,
+  by = "ensembl_gene_id",
+  all.x = TRUE
+)
+
+expr_mapped <- expr_mapped[!is.na(expr_mapped$hgnc_symbol) & expr_mapped$hgnc_symbol != "", ]
+
+sample_cols <- setdiff(colnames(expr_mapped),
+                       c("Ensembl_ID", "ensembl_gene_id", "hgnc_symbol"))
+
+expr_symbol_avg <- aggregate(
+  x = expr_mapped[, sample_cols],
+  by = list(GeneSymbol = expr_mapped$hgnc_symbol),
+  FUN = mean,
+  na.rm = TRUE
+)
+
+rownames(expr_symbol_avg) <- expr_symbol_avg$GeneSymbol
+expr_symbol_avg$GeneSymbol <- NULL
+
+dim(expr_symbol_avg)
+head(rownames(expr_symbol_avg))
+
+expr_df <- expr_symbol_avg
+expr_df$sample <- rownames(expr_symbol_avg)
+expr_df <- expr_df[,c(515, 1:514)]
+rownames(expr_df) <- NULL
+
+colnames(expr_df) <- sub("\\.[^.]+$", "", colnames(expr_df))
+length(colnames(expr_df))
+length(unique(colnames(expr_df)))
+expr_df <- expr_df[, !duplicated(colnames(expr_df))]
+
+
+
+############################################################
+############################################################
+DEG_sig <- readRDS("Visium_tumor_DEG_RCTD.rds") %>%
+  filter(abs(avg_log2FC) > 0.5, p_val_adj < 0.05)
+
+proliferating_markers <- DEG_sig %>% arrange(desc(avg_log2FC)) %>% filter(avg_log2FC > 0)
+invasive_markers <- DEG_sig %>% arrange(avg_log2FC)        %>% filter(avg_log2FC < 0)
+
+proliferating_sig <- head(proliferating_markers$gene, 50)
+markers_sig <- head(markers_markers$gene, 50)
+
+############################################################
+############################################################
+pheno_df <- pheno_df %>%
+  mutate(sample_fixed = gsub("-", ".", sample))
+
+common_samples <- intersect(colnames(expr_df), pheno_df$sample_fixed)
+
+expr_use <- as.matrix(expr_df[, common_samples, drop = FALSE])
+
+pheno_use <- pheno_df %>%
+  filter(sample_fixed %in% common_samples) %>%
+  distinct(sample_fixed, .keep_all = TRUE) %>%
+  arrange(match(sample_fixed, common_samples))
+
+pheno_use <- pheno_use %>%
+  mutate(
+    OS_time_days  = as.numeric(OS.time),
+    OS_time_years = OS_time_days / 365,
+    OS_event      = as.numeric(OS)  
+  )
+
+############################################################
+############################################################
+rownames(expr_use) <- expr_df$sample
+
+proliferating_sig_use <- intersect(rownames(expr_use), proliferating_sig)
+invasive_sig_use <- intersect(rownames(expr_use), invasive_sig)
+
+ranked <- rankGenes(expr_use)
+
+gs_proliferating <- GeneSet(setName = "proliferating_sig", geneIds = proliferating_sig_use)
+gs_invasive <- GeneSet(setName = "invasive_sig", geneIds = invasive_sig_use)
+gsc <- GeneSetCollection(list(gs_proliferating, gs_invasive))
+
+ms <- multiScore(ranked, upSetColc = gsc)
+score_mat <- as.data.frame(t(ms$Scores))   # rows = samples, cols = gene sets
+head(score_mat)
+
+pheno_use$proliferating_score <- score_mat[pheno_use$sample_fixed, "proliferating_sig"]
+pheno_use$invasive_score <- score_mat[pheno_use$sample_fixed, "invasive_sig"]
+
+############################################################
+############################################################
+pheno_use <- pheno_use %>%
+  mutate(
+    proliferating_z = as.numeric(scale(proliferating_score)),
+    invasive_z = as.numeric(scale(invasive_score)),
+    like_group = ifelse(proliferating_z >= invasive_z, "Proliferating-like", "Invasive-like")
+  )
+
+pheno_use$like_group <- factor(pheno_use$like_group,
+                               levels = c("Proliferating-like", "Invasive-like"))
+
+
+############################################################
+############################################################
+fit_km_like <- survfit(Surv(OS_time_years, OS_event) ~ like_group, data = pheno_use)
+
+fit_cox_like <- tryCatch(
+  coxph(Surv(OS_time_years, OS_event) ~ like_group, data = pheno_use),
+  error = function(e) e
+)
+
+hr <- ci <- p <- NA_real_
+if (!inherits(fit_cox_like, "error")) {
+  s <- summary(fit_cox_like)
+  coef_df <- as.data.frame(s$coefficients)
+  conf_df <- as.data.frame(s$conf.int)
+  hr <- as.numeric(coef_df[1, "exp(coef)"])
+  p  <- as.numeric(coef_df[1, "Pr(>|z|)"])
+  ci <- as.numeric(conf_df[1, c("lower .95", "upper .95")])
+} else {
+  warning("coxph 실패: ", fit_cox_like$message)
+  fit_cox_like <- NULL
+}
+
+g_like <- ggsurvplot(
+  fit_km_like,
+  data = pheno_use,
+  risk.table = TRUE,
+  pval = FALSE,          
+  conf.int = FALSE,
+  xlab = "Time (years)",
+  ylab = "Overall survival probability",
+  break.time.by = 1,
+  legend.title = NULL,
+  legend.labs = c("Proliferating-like", "Invasive-like"),
+  palette = c("#FF0000", "#FFAF1F"),
+  ggtheme = theme_classic() +
+    theme(
+      axis.title.x = element_text(size = 16),
+      axis.title.y = element_text(size = 20),
+      axis.text.x  = element_text(size = 14),
+      axis.text.y  = element_text(size = 14),
+      legend.text  = element_text(size = 16),
+      legend.title = element_blank()
+    )
+)
+
+g_like$plot <- g_like$plot +
+  ggtitle("TCGA-COAD") +
+  theme(
+    plot.title = element_text(hjust = 0.5, size = 28),
+    legend.position = c(0.75, 0.15)
+  )
+
+g_like$table <- g_like$table + theme(axis.title.y = element_blank())
+
+# ---- HR/CI (Cox) ----
+hr_line <- sprintf("HR = %.2f (%.2f–%.2f)", hr, ci[1], ci[2])
+
+# ---- p-value ----
+sd <- survdiff(Surv(OS_time_years, OS_event) ~ like_group, data = pheno_use)
+p_logrank <- 1 - pchisq(sd$chisq, df = length(sd$n) - 1)
+p_line <- sprintf("p = %.3g", p_logrank)
+
+x_anno <- max(pheno_use$OS_time_years, na.rm = TRUE) * 0.05
+
+g_like$plot <- g_like$plot +
+  annotate("text", x = x_anno, y = 0.25, label = hr_line, hjust = 0, size = 7) +
+  annotate("text", x = x_anno, y = 0.18, label = p_line,  hjust = 0, size = 7)
+
+print(g_like)
